@@ -1,0 +1,136 @@
+name: build-release
+
+# Builds this fork (upstream Alpha + the group-failover patch on `patched`) and
+# publishes it as the rolling pre-release `patched-latest`, so deployments can
+# pull a ready binary instead of compiling:
+#
+#   https://github.com/<owner>/mihomo/releases/download/patched-latest/mihomo-linux-amd64.gz
+#   https://github.com/<owner>/mihomo/releases/download/patched-latest/mihomo-linux-arm64.gz
+#
+# Assets are named `mihomo-<goos>-<goarch>.gz`, so a Dockerfile can pick them by
+# architecture without guessing version numbers.
+
+on:
+  # called by sync-upstream.yml after it rebased `patched`
+  workflow_call:
+  push:
+    branches:
+      - patched
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string (default: patched-<short sha>+upstream-<base>)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Create the rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view patched-latest >/dev/null 2>&1 || gh release create patched-latest \
+            --prerelease --target patched \
+            --title "patched-latest (upstream Alpha + group failover)" \
+            --notes "Rolling build of \`patched\` = upstream MetaCubeX/mihomo Alpha + \`patches/patched-group-failover.patch\`. Assets: \`mihomo-linux-<arch>.gz\` (+ .sha256), \`version.txt\`."
+
+      - name: Publish version.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "commit: $(git rev-parse HEAD)"
+            echo "upstream Alpha base: $(git log -1 --format='%h %s' HEAD^)"
+            echo "built: $(date -u)"
+          } > version.txt
+          cat version.txt
+          gh release upload patched-latest version.txt --clobber
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goarch: amd64, goamd64: v1 }
+          - { goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2   # HEAD^ is the upstream Alpha commit this build is based on
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          check-latest: false
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+        run: |
+          version="patched-$(git rev-parse --short HEAD)+upstream-$(git rev-parse --short HEAD^)"
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
+          fi
+          buildtime="$(date -u)"
+          mkdir -p dist
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${buildtime}' \
+                      -w -s -buildid=" \
+            -o dist/mihomo-linux-${{ matrix.goarch }} .
+
+      - name: Smoke test the binary
+        # the runner is amd64, an arm64 binary cannot be executed here
+        if: matrix.goarch == 'amd64'
+        run: |
+          ./dist/mihomo-linux-${{ matrix.goarch }} -v
+          cat > /tmp/probe.yaml <<'YAML'
+          log-level: silent
+          mode: rule
+          ipv6: false
+          socks-port: 0
+          rules:
+            - "MATCH,DIRECT"
+          YAML
+          ./dist/mihomo-linux-${{ matrix.goarch }} -t -f /tmp/probe.yaml
+
+      - name: Pack
+        run: |
+          gzip -9 -c dist/mihomo-linux-${{ matrix.goarch }} > dist/mihomo-linux-${{ matrix.goarch }}.gz
+          sha256sum dist/mihomo-linux-${{ matrix.goarch }}.gz > dist/mihomo-linux-${{ matrix.goarch }}.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-linux-${{ matrix.goarch }}
+          path: |
+            dist/mihomo-linux-${{ matrix.goarch }}
+            dist/mihomo-linux-${{ matrix.goarch }}.gz
+            dist/mihomo-linux-${{ matrix.goarch }}.gz.sha256
+
+      - name: Publish to the rolling pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload patched-latest \
+            dist/mihomo-linux-${{ matrix.goarch }}.gz \
+            dist/mihomo-linux-${{ matrix.goarch }}.gz.sha256 \
+            --clobber

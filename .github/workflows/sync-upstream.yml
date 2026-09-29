@@ -1,0 +1,120 @@
+name: sync-upstream
+
+# Keeps the `patched` branch rebased on top of MetaCubeX/mihomo (Alpha by
+# default, switch with the repository variable BASE_BRANCH, e.g.
+# `gh variable set BASE_BRANCH --body Meta --repo <owner>/mihomo`):
+#   1. rebase patched onto upstream/Alpha (or BASE_BRANCH)
+#   2. force-push (the branch is always "upstream + our patch commit")
+#   3. call build-release.yml (reusable workflow) to publish fresh binaries
+# If the rebase conflicts (upstream touched the same code) the branch is left
+# untouched and an issue is opened instead.
+#
+# Why not the GitHub "Sync fork" button: it syncs fork:<name> from
+# upstream:<name>, so it only works for branches whose name exists upstream.
+# `patched` does not exist upstream, and GitHub then compares against the
+# upstream *default* branch (upstream's `main` is an unrelated legacy tree),
+# which always conflicts. The button is the right tool for the `Alpha` mirror
+# branch; the patched branch syncs through this workflow.
+
+on:
+  schedule:
+    - cron: "23 2 * * *" # daily
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: "Rebuild the rolling release even when upstream has not moved"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.push.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: patched
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name "patched-sync-bot"
+          git config user.email "patched-sync-bot@users.noreply.github.com"
+
+      - name: Rebase onto upstream/Alpha
+        id: rebase
+        run: |
+          base="${{ vars.BASE_BRANCH || 'Alpha' }}"
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch upstream "$base"
+          echo "upstream=$(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          if git rebase FETCH_HEAD; then
+            echo "state=rebased" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "state=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the rebased branch
+        id: push
+        if: steps.rebase.outputs.state == 'rebased'
+        run: |
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/patched)" ]; then
+            echo "already up to date with upstream (${{ steps.rebase.outputs.upstream }})"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git push --force-with-lease origin patched
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report a rebase conflict
+        if: steps.rebase.outputs.state == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::error::patched needs a manual rebase onto upstream/${{ steps.rebase.outputs.base }} (${{ steps.rebase.outputs.upstream }}) - see the run summary and the issue opened below"
+          title="patched branch needs a rebase onto upstream/${{ steps.rebase.outputs.base }}"
+          body=$(cat <<EOF
+          \`git rebase upstream/${{ steps.rebase.outputs.base }}\` conflicts for upstream \`${{ steps.rebase.outputs.upstream }}\`.
+
+          The \`patched\` branch was left untouched, so nothing is broken - but the
+          patch has to be ported by hand before the next build:
+
+          \`\`\`sh
+          git clone --branch patched git@github.com:${{ github.repository }}.git
+          cd mihomo && git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch upstream ${{ steps.rebase.outputs.base }} && git rebase FETCH_HEAD  # resolve, then:
+          git push --force-with-lease origin patched
+          \`\`\`
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+          number=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+      - name: Fail loudly on conflict
+        if: steps.rebase.outputs.state == 'conflict'
+        run: exit 1
+
+  # A push made with GITHUB_TOKEN does not trigger other workflows, so the build
+  # is called directly (reusable workflow) instead of being dispatched.
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || inputs.force_build == true
+    uses: ./.github/workflows/build-release.yml

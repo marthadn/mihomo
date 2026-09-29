@@ -15,7 +15,11 @@ import (
 )
 
 type URLTestOption struct {
-	Tolerance uint16 `group:"tolerance,omitempty"`
+	Tolerance    uint16 `group:"tolerance,omitempty"`
+	Race         int    `group:"race,omitempty"`
+	Retry        int    `group:"retry,omitempty"`
+	WarmStandbys int    `group:"warm-standbys,omitempty"`
+	WarmInterval int    `group:"warm-interval,omitempty"`
 }
 
 type URLTest struct {
@@ -27,6 +31,7 @@ type URLTest struct {
 	disableUDP     bool
 	fastNode       C.Proxy
 	fastSingle     *singledo.Single[C.Proxy]
+	failover       *failoverDialer
 }
 
 func (u *URLTest) Now() string {
@@ -55,12 +60,9 @@ func (u *URLTest) ForceSet(name string) {
 
 // DialContext implements C.ProxyAdapter
 func (u *URLTest) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
-	proxy := u.fast(true)
-	c, err = proxy.DialContext(ctx, metadata)
+	proxy, c, err := u.failover.dial(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(u)
-	} else {
-		u.onDialFailed(proxy.Type(), err, u.healthCheck)
 	}
 
 	if N.NeedHandshake(c) {
@@ -216,6 +218,20 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 		expectedStatus: option.ExpectedStatus,
 		tolerance:      urlTestOption.Tolerance,
 	}
+	urlTest.failover = newFailoverDialer(
+		urlTest.GroupBase,
+		func() C.Proxy { return urlTest.fast(true) },
+		func(proxy C.Proxy) bool { return urlTest.selected != "" && urlTest.selected == proxy.Name() },
+		option.URL,
+		option.ExpectedStatus,
+		FailoverOption{
+			Race:         urlTestOption.Race,
+			Retry:        urlTestOption.Retry,
+			WarmStandbys: urlTestOption.WarmStandbys,
+			WarmInterval: urlTestOption.WarmInterval,
+		},
+		option.Interval,
+	)
 
 	return urlTest, nil
 }
