@@ -13,7 +13,12 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
-type FallbackOption struct{}
+type FallbackOption struct {
+	Race         int `group:"race,omitempty"`
+	Retry        int `group:"retry,omitempty"`
+	WarmStandbys int `group:"warm-standbys,omitempty"`
+	WarmInterval int `group:"warm-interval,omitempty"`
+}
 
 type Fallback struct {
 	*GroupBase
@@ -21,6 +26,7 @@ type Fallback struct {
 	testUrl        string
 	selected       string
 	expectedStatus string
+	failover       *failoverDialer
 }
 
 func (f *Fallback) Now() string {
@@ -29,13 +35,10 @@ func (f *Fallback) Now() string {
 }
 
 // DialContext implements C.ProxyAdapter
-func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	proxy := f.findAliveProxy(true)
-	c, err := proxy.DialContext(ctx, metadata)
+func (f *Fallback) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
+	proxy, c, err := f.failover.dial(ctx, metadata)
 	if err == nil {
 		c.AppendToChains(f)
-	} else {
-		f.onDialFailed(proxy.Type(), err, f.healthCheck)
 	}
 
 	if N.NeedHandshake(c) {
@@ -160,7 +163,7 @@ func (f *Fallback) Proxies() []C.Proxy {
 }
 
 func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*Fallback, error) {
-	return &Fallback{
+	fallback := &Fallback{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
 			Type:           C.Fallback,
@@ -177,5 +180,21 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
-	}, nil
+	}
+	fallback.failover = newFailoverDialer(
+		fallback.GroupBase,
+		func() C.Proxy { return fallback.findAliveProxy(true) },
+		func(proxy C.Proxy) bool { return fallback.selected != "" && fallback.selected == proxy.Name() },
+		option.URL,
+		option.ExpectedStatus,
+		FailoverOption{
+			Race:         fallbackOption.Race,
+			Retry:        fallbackOption.Retry,
+			WarmStandbys: fallbackOption.WarmStandbys,
+			WarmInterval: fallbackOption.WarmInterval,
+		},
+		option.Interval,
+	)
+
+	return fallback, nil
 }
