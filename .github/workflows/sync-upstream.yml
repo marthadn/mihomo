@@ -70,7 +70,7 @@ jobs:
             echo "state=conflict" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Push the rebased branch
+      - name: Push the merged branch
         id: push
         if: steps.rebase.outputs.state == 'merged'
         run: |
@@ -82,7 +82,7 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Report a rebase conflict
+      - name: Report a merge conflict
         if: steps.rebase.outputs.state == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
